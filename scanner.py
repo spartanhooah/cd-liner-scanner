@@ -16,7 +16,6 @@ import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-import pytesseract
 from PIL import Image, ImageTk
 from deskew import determine_skew
 import img2pdf
@@ -83,94 +82,120 @@ def deskew_image(img: Image.Image) -> Image.Image:
     """Return a deskewed copy of img, or img unchanged if skew is negligible."""
     grayscale = np.array(img.convert("L"))
     angle = determine_skew(grayscale)
-    if angle is None or abs(angle) < 0.5 or abs(angle) > 45:
+    # Clamp to ±15°: genuine flatbed skew is always small. Larger angles indicate
+    # a major orientation error that deskew should not try to fix.
+    if angle is None or abs(angle) < 0.5 or abs(angle) > 15:
         return img
     return img.rotate(angle, expand=True, fillcolor=(255, 255, 255))
 
 
-_ROTATION_ANGLES = {
-    "90° clockwise":         270,  # PIL rotates CCW, so CW = 270
-    "90° counter-clockwise": 90,
-    "180°":                  180,
-}
 
-def auto_orient(
-    img: Image.Image, hint: int | None = None, mode: str = "auto"
-) -> tuple[Image.Image, int | None]:
-    """Rotate portrait images to landscape when the booklet was placed sideways.
+# Standard CD booklet panel: 120 mm × 120 mm at 300 dpi.
+# Interior spreads are two panels side by side (240 mm wide).
+_CD_PANEL_PX  = round(120 * 300 / 25.4)   # 1417 px
+_CD_SPREAD_PX = round(240 * 300 / 25.4)   # 2835 px
 
-    mode is the rotation_var value from the UI. When it is not 'auto' the angle
-    is applied directly without OCR. hint carries the OCR result across pages so
-    artwork-only pages stay consistent with text-rich ones.
+# Fallback crop constants used when auto-detection fails.
+# _SCAN_RIGHT_GAP_PX: scanner-frame margin (px) between img.width and the physical
+#                     booklet edge after 90° CW rotation.  Adjust if detection
+#                     keeps failing and content is consistently cut or padded.
+_SCAN_RIGHT_GAP_PX = 50
+
+# Threshold below which a pixel is considered "booklet content" rather than
+# blank scanner glass.  240 catches coloured artwork and black text.
+_CONTENT_THRESHOLD = 240
+
+# How close (px) to the expected right edge detected content must be to count
+# as "reaching the physical booklet edge" rather than an interior text margin.
+_EDGE_TOLERANCE_PX = 200
+
+
+def _detect_right_edge(paths: list[str]) -> int:
+    """Return the right_edge_px of the booklet in the 90°-CW-rotated images.
+
+    The booklet is pressed flush to the scanner glass short edge, so its right
+    edge in the landscape output is nearly constant across pages.  Detected from
+    the cover (paths[0]) or back (paths[-1]) first — those have full-bleed art
+    that reaches the physical panel edge.  Interior low-contrast spreads are
+    skipped; the rightmost ink pixel sits inside the panel, not at its edge.
+    Falls back to img.width - _SCAN_RIGHT_GAP_PX if all detection fails.
+
+    Panel height is NOT detected here.  CD booklet panels are a fixed physical
+    size (120 mm square at 300 dpi = _CD_PANEL_PX px).  Detecting height from
+    content rows risks including scanner-edge shadows or album-art borders that
+    push the boundary beyond the actual panel edge, adding whitespace at the
+    bottom.  height = _CD_PANEL_PX always.
     """
-    w, h = img.size
+    best_var, best_path = -1.0, paths[0]
+    img_width = None
+    for p in paths:
+        img = Image.open(p).rotate(270, expand=True)
+        if img_width is None:
+            img_width = img.width
+            print(f"[crop-debug] rotated size {img.width}×{img.height}")
+        thumb = img.copy()
+        thumb.thumbnail((400, 300), Image.LANCZOS)
+        v = float(np.array(thumb.convert("L")).var())
+        if v > best_var:
+            best_var, best_path = v, p
 
-    # Explicit rotation: always apply regardless of aspect ratio.
-    # Cover panels are nearly square so h <= w*1.3, but they still need
-    # the same rotation as interior spreads when the user picked a direction.
-    if mode in _ROTATION_ANGLES:
-        angle = _ROTATION_ANGLES[mode]
-        return img.rotate(angle, expand=True), angle
+    right = None
+    for p in dict.fromkeys([paths[0], paths[-1], best_path]):
+        img = Image.open(p).rotate(270, expand=True)
+        a = np.array(img.convert("L"))
+        cols = np.where((a < _CONTENT_THRESHOLD).any(axis=0))[0]
+        if len(cols) < 2:
+            continue
+        candidate = int(cols[-1])
+        # Accept only if content reaches within _EDGE_TOLERANCE_PX of img.width.
+        # A farther position means we found an interior ink pixel, not the edge.
+        if img.width - candidate <= _EDGE_TOLERANCE_PX:
+            right = candidate
+            print(f"[crop-debug] right edge {right} from {Path(p).name}")
+            break
 
-    # auto: skip images that are already landscape or nearly square
-    if h <= w * 1.3:
-        return img, hint
+    if right is None:
+        right = (img_width or 0) - _SCAN_RIGHT_GAP_PX
+        print(f"[crop-debug] right edge fallback: {right}")
 
-    # auto — try OCR if we have no hint yet
-    if hint is not None:
-        return img.rotate(hint, expand=True), hint
-
-    best_angle, best_count = 90, -1
-    for angle in (90, 270):
-        thumb = img.rotate(angle, expand=True).copy()
-        thumb.thumbnail((1200, 1200), Image.LANCZOS)
-        try:
-            data = pytesseract.image_to_data(
-                thumb, output_type=pytesseract.Output.DICT, config="--psm 3"
-            )
-            count = sum(
-                1 for conf, text in zip(data["conf"], data["text"])
-                if int(conf) > 30 and text.strip()
-            )
-        except Exception:
-            count = 0
-        if count > best_count:
-            best_count, best_angle = count, angle
-
-    if best_count > 0:
-        return img.rotate(best_angle, expand=True), best_angle
-    return img, hint
+    return right
 
 
-def autocrop(img: Image.Image, margin: int = 30) -> Image.Image:
-    """Crop to the bounding box of non-background content, leaving a small margin.
+def _find_vertical_top(img: Image.Image) -> int:
+    """Slide the _CD_PANEL_PX-tall window to the best vertical position for this page.
 
-    Samples actual border pixels to set the threshold adaptively, so JPEG
-    compression artifacts in the scanner glass don't fool a fixed cutoff.
+    - If content spans most of _CD_PANEL_PX, anchor at the first content row
+      (the physical top edge of the panel is visible in the scan).
+    - If content is narrower (text with margins, sparse ink), centre the window
+      over the detected content band.
+    - If nothing is detectable (white paper on white glass), centre in the image.
     """
     arr = np.array(img.convert("L"))
-    h, w = arr.shape
+    rows = np.where((arr < _CONTENT_THRESHOLD).any(axis=1))[0]
 
-    border = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]])
-    bg_level = float(np.percentile(border, 95))
-    threshold = max(bg_level - 20, 0)
+    if len(rows) == 0:
+        top = (img.height - _CD_PANEL_PX) // 2
+    else:
+        top_row = int(rows[0])
+        bot_row = int(rows[-1])
+        if bot_row - top_row >= _CD_PANEL_PX * 0.8:
+            # Full-bleed page — physical top edge detected
+            top = top_row
+        else:
+            # Margins or sparse content — centre the window on what we found
+            mid = (top_row + bot_row) // 2
+            top = mid - _CD_PANEL_PX // 2
 
-    mask = arr < threshold
-    if not mask.any():
-        return img
+    return max(0, min(top, img.height - _CD_PANEL_PX))
 
-    # Require ≥5% of pixels in a row/column to be non-background.
-    # Scanner glass columns contain JPEG quantization noise and platen
-    # imperfections that can reach ~1-2% density; real booklet content
-    # columns are typically 20%+ dark, so 5% cleanly separates them.
-    rows = np.where(mask.mean(axis=1) > 0.05)[0]
-    cols = np.where(mask.mean(axis=0) > 0.05)[0]
-    if not len(rows) or not len(cols):
-        return img
-    top    = max(0, rows[0]  - margin)
-    bottom = min(h, rows[-1] + margin + 1)
-    left   = max(0, cols[0]  - margin)
-    right  = min(w, cols[-1] + margin + 1)
+
+def crop_to_booklet(
+    img: Image.Image, top: int, right: int, is_spread: bool
+) -> Image.Image:
+    """Crop img to booklet dimensions using per-page top and session-wide right edge."""
+    crop_w = _CD_SPREAD_PX if is_spread else _CD_PANEL_PX
+    left   = max(0, right - crop_w)
+    bottom = min(img.height, top + _CD_PANEL_PX)
     return img.crop((left, top, right, bottom))
 
 
@@ -255,17 +280,6 @@ class LinerScannerApp(tk.Tk):
         tk.Entry(dir_frame, textvariable=self.dir_var, font=("Sans", 10),
                  width=38, state="readonly").pack(side=tk.LEFT, padx=(6, 4))
         tk.Button(dir_frame, text="Browse…", command=self._browse_dir).pack(side=tk.LEFT)
-
-        rot_frame = tk.Frame(f)
-        rot_frame.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        tk.Label(rot_frame, text="Page rotation:", font=("Sans", 10)).pack(side=tk.LEFT)
-        self.rotation_var = tk.StringVar(value="auto")
-        rot_menu = ttk.Combobox(
-            rot_frame, textvariable=self.rotation_var, state="readonly",
-            font=("Sans", 10), width=24,
-            values=["auto", "90° clockwise", "90° counter-clockwise", "180°"],
-        )
-        rot_menu.pack(side=tk.LEFT, padx=(6, 0))
 
         self.start_btn = tk.Button(
             f, text="Start Scanning", font=("Sans", 11, "bold"),
@@ -593,40 +607,41 @@ class LinerScannerApp(tk.Tk):
         self._show_phase(3)
         self.progress["maximum"] = len(self.scanned_paths) + 1
         self.progress["value"] = 0
-        rotation_mode = self.rotation_var.get()
-        threading.Thread(target=self._compile_worker, args=(rotation_mode,), daemon=True).start()
+        threading.Thread(target=self._compile_worker, daemon=True).start()
 
-    def _compile_worker(self, rotation_mode: str):
+    def _compile_worker(self):
         corrected: list[str] = []
-        rotation_hint: int | None = None
+        n = len(self.scanned_paths)
+
+        # Detect right edge once for the whole session.
+        # Panel height is always _CD_PANEL_PX — detecting it from content rows
+        # risks picking up scanner-edge shadows that inflate the value and add
+        # whitespace at the bottom.  Vertical position is found per-page.
+        self.after(0, self.proc_var.set, "Analysing pages for crop bounds…")
+        try:
+            right = _detect_right_edge(self.scanned_paths)
+        except Exception as e:
+            print(f"[crop-debug] right-edge detection failed ({e}), using fallback")
+            right = None
+
         for i, src in enumerate(self.scanned_paths):
-            n = len(self.scanned_paths)
             self.after(0, self.proc_var.set, f"Processing page {i + 1} of {n}…")
             img = Image.open(src)
 
-            pre = img.size
-            try:
-                img = autocrop(img)
-            except Exception as e:
-                self.after(0, self.proc_var.set, f"Page {i+1}: crop failed — {e}")
-            else:
-                self.after(0, self.proc_var.set,
-                           f"Page {i+1}: crop {pre} → {img.size}")
+            img = img.rotate(270, expand=True)  # 90° clockwise (PIL rotates CCW)
 
-            try:
-                img, rotation_hint = auto_orient(img, rotation_hint, rotation_mode)
-            except Exception as e:
-                self.after(0, self.proc_var.set, f"Page {i+1}: orientation failed — {e}")
+            page_right = right if right is not None else img.width - _SCAN_RIGHT_GAP_PX
 
             try:
                 img = deskew_image(img)
             except Exception as e:
                 self.after(0, self.proc_var.set, f"Page {i+1}: deskew failed — {e}")
 
-            try:
-                img = autocrop(img, margin=0)
-            except Exception as e:
-                self.after(0, self.proc_var.set, f"Page {i+1}: final crop failed — {e}")
+            # Slide the _CD_PANEL_PX-tall window to this page's content.
+            top = _find_vertical_top(img)
+
+            # First and last pages are single panels; interior pages are spreads.
+            img = crop_to_booklet(img, top, page_right, is_spread=(0 < i < n - 1))
 
             dest = src.replace(".tiff", "_processed.tiff")
             img.save(dest, format="TIFF", compression="lzw")
